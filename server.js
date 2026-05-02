@@ -154,6 +154,45 @@ function normalizePublicBaseUrl(raw) {
   return value;
 }
 
+/** HTTPS origin from proxy headers when the browser hit this deployment over TLS (Railway, etc.). */
+function httpsPublicBaseFromRequest(req) {
+  const host = req.get("host");
+  const xf = req.get("x-forwarded-proto");
+  const proto = xf ? String(xf).split(",")[0].trim().toLowerCase() : "";
+  if (!host || proto !== "https") {
+    return "";
+  }
+  return normalizePublicBaseUrl(`https://${host}`);
+}
+
+/**
+ * Builds image_url host: prefers request HTTPS host when PUBLIC_BASE_URL is missing or still ngrok
+ * while the UI is loaded from Railway/production (Instagram cannot crawl free ngrok).
+ */
+function resolvePublicBaseUrlForUploads(req) {
+  const envUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL || "");
+  const derived = httpsPublicBaseFromRequest(req);
+  const envIsNgrok = envUrl.includes("ngrok");
+  const derivedIsNgrok = derived.includes("ngrok");
+
+  if (derived && /^https:\/\//i.test(derived)) {
+    if (envIsNgrok && !derivedIsNgrok) {
+      return { base: derived, source: "request_host_overrides_stale_ngrok_env" };
+    }
+    if (!envUrl) {
+      return { base: derived, source: "request_host_no_env" };
+    }
+  }
+
+  if (envUrl) {
+    return { base: envUrl, source: "env" };
+  }
+  if (derived) {
+    return { base: derived, source: "request_host_fallback" };
+  }
+  return { base: "", source: "none" };
+}
+
 function requiredEnv(name) {
   const value = process.env[name];
   if (!value) {
@@ -860,7 +899,7 @@ app.post("/api/uploads", async (req, res) => {
     fs.writeFileSync(localFilePath, jpegBuffer);
     const outMime = "image/jpeg";
 
-    const publicBaseUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL);
+    const { base: publicBaseUrl, source: publicBaseSource } = resolvePublicBaseUrlForUploads(req);
     if (publicBaseUrl) {
       if (publicBaseUrl.includes("abc123.ngrok-free.app")) {
         return res.status(400).json({
@@ -876,7 +915,17 @@ app.post("/api/uploads", async (req, res) => {
         });
       }
 
-      return res.json({ imageUrl: `${publicBaseUrl}/uploads/${safeFileName}` });
+      const imageUrl = `${publicBaseUrl}/uploads/${safeFileName}`;
+      const payload =
+        publicBaseSource === "request_host_overrides_stale_ngrok_env"
+          ? {
+              imageUrl,
+              publicBaseNotice:
+                "image_url uses this deployment HTTPS host — remove ngrok from PUBLIC_BASE_URL on Railway so config matches publishing."
+            }
+          : { imageUrl };
+
+      return res.json(payload);
     }
 
     const imageUrl = await uploadImageToPublicHost(jpegBuffer, safeFileName, outMime);
