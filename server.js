@@ -157,6 +157,27 @@ function requiredEnv(name) {
   return value;
 }
 
+function oauthRedirectUriFromEnv() {
+  return requiredEnv("REDIRECT_URI").trim();
+}
+
+/**
+ * Parses redirect URI so you can mirror values in Meta: App domains = host only; Website Site URL = origin/.
+ * @returns {{ host: string, origin: string, invalid: boolean }}
+ */
+function metaOAuthHostHints(redirectUri) {
+  try {
+    const u = new URL(redirectUri);
+    return {
+      invalid: false,
+      host: u.host,
+      origin: `${u.protocol}//${u.host}`
+    };
+  } catch {
+    return { invalid: true, host: "", origin: "" };
+  }
+}
+
 /**
  * Logs full Graph error payloads (including error_user_title / error_user_msg / fbtrace_id) to stderr.
  * Use when debugging opaque errors like OAuthException (#1).
@@ -441,7 +462,7 @@ app.get("/api/config", (_req, res) => {
 app.get("/api/auth/url", (_req, res) => {
   try {
     const appId = requiredEnv("INSTAGRAM_APP_ID");
-    const redirectUri = requiredEnv("REDIRECT_URI");
+    const redirectUri = oauthRedirectUriFromEnv();
     const scopes = [
       "instagram_basic",
       "instagram_content_publish",
@@ -459,7 +480,20 @@ app.get("/api/auth/url", (_req, res) => {
       `&scope=${encodeURIComponent(scopes.join(","))}` +
       "&response_type=code";
 
-    res.json({ authUrl });
+    const hints = metaOAuthHostHints(redirectUri);
+    res.json({
+      authUrl,
+      redirectUri,
+      metaCheck: hints.invalid
+        ? {
+            redirectUriInvalidUrl: true
+          }
+        : {
+            appDomainsPlainHost: hints.host,
+            websiteSiteUrlSuggested: `${hints.origin}/`,
+            oauthRedirectUriForMetaLoginSettings: redirectUri
+          }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -475,7 +509,7 @@ app.get("/api/auth/callback", async (req, res) => {
   try {
     const appId = requiredEnv("INSTAGRAM_APP_ID");
     const appSecret = requiredEnv("INSTAGRAM_APP_SECRET");
-    const redirectUri = requiredEnv("REDIRECT_URI");
+    const redirectUri = oauthRedirectUriFromEnv();
 
     const tokenResponse = await axios.get(`${FB_GRAPH_BASE}/oauth/access_token`, {
       params: {
