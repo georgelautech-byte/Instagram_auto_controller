@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
 const dotenv = require("dotenv");
@@ -10,8 +11,11 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.set("trust proxy", 1);
+
 app.use(cors());
 app.use(express.json({ limit: "15mb" }));
+app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const FB_GRAPH_BASE = "https://graph.facebook.com/v25.0";
@@ -176,6 +180,50 @@ function metaOAuthHostHints(redirectUri) {
   } catch {
     return { invalid: true, host: "", origin: "" };
   }
+}
+
+function base64UrlDecodeToBuffer(input) {
+  let b64 = String(input).replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4 !== 0) {
+    b64 += "=";
+  }
+  return Buffer.from(b64, "base64");
+}
+
+/**
+ * Verifies Meta's signed_request (HMAC-SHA256 over the encoded payload segment).
+ * @returns {object|null}
+ */
+function parseFbSignedRequest(signedRequest, appSecret) {
+  if (!signedRequest || typeof signedRequest !== "string") {
+    return null;
+  }
+  const parts = signedRequest.split(".");
+  if (parts.length !== 2) {
+    return null;
+  }
+  const [encodedSig, payloadEncoded] = parts;
+  let sig;
+  let expectedSig;
+  try {
+    sig = base64UrlDecodeToBuffer(encodedSig);
+    expectedSig = crypto.createHmac("sha256", appSecret).update(payloadEncoded).digest();
+  } catch {
+    return null;
+  }
+  if (sig.length !== expectedSig.length || !crypto.timingSafeEqual(sig, expectedSig)) {
+    return null;
+  }
+  let data;
+  try {
+    data = JSON.parse(base64UrlDecodeToBuffer(payloadEncoded).toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!data || String(data.algorithm).toUpperCase() !== "HMAC-SHA256") {
+    return null;
+  }
+  return data;
 }
 
 /**
@@ -497,6 +545,60 @@ app.get("/api/auth/url", (_req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+/**
+ * Meta Dashboard → User data deletion → Data deletion callback URL (POST signed_request).
+ * https://developers.facebook.com/docs/development/create-an-app/app-dashboard/data-deletion-callback
+ */
+app.post("/api/meta/data-deletion", (req, res) => {
+  const signedRequest = req.body?.signed_request;
+  if (!signedRequest) {
+    return res.status(400).json({ error: "Missing signed_request." });
+  }
+
+  let appSecret;
+  try {
+    appSecret = requiredEnv("INSTAGRAM_APP_SECRET");
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+
+  const payload = parseFbSignedRequest(signedRequest, appSecret);
+  if (!payload) {
+    return res.status(400).json({ error: "Invalid signed_request." });
+  }
+
+  const fbUserId = payload.user_id != null ? String(payload.user_id) : null;
+  if (fbUserId && state.userId && String(state.userId) === fbUserId) {
+    state.userAccessToken = null;
+    state.pageAccessToken = null;
+    state.userId = null;
+  }
+
+  const confirmationCode = crypto.randomBytes(16).toString("hex");
+  const host = req.get("host");
+  const protoChunk = req.get("x-forwarded-proto") || "";
+  const proto =
+    (protoChunk.split(",")[0] && protoChunk.split(",")[0].trim()) || req.protocol || "https";
+  const baseForStatus =
+    normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL) || (host ? `${proto}://${host}` : "");
+
+  const statusUrl = baseForStatus
+    ? `${baseForStatus}/data-deletion-status.html?code=${encodeURIComponent(confirmationCode)}`
+    : "";
+
+  if (!statusUrl) {
+    return res.status(500).json({
+      error:
+        "Set PUBLIC_BASE_URL to your HTTPS app URL so Meta receives a deletion status link, or confirm Host is sent on POST."
+    });
+  }
+
+  return res.json({
+    url: statusUrl,
+    confirmation_code: confirmationCode
+  });
 });
 
 app.get("/api/auth/callback", async (req, res) => {
