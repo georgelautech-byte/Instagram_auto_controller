@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Data deletion request</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>Data deletion request</h1>
+      <p class="note">
+        If you started a deletion request from your Facebook settings, this app has acknowledged it.
+      </p>
+      <section class="panel">
+        <p>
+          Confirmation code:
+          <code id="confirmationCode">&mdash;</code>
+        </p>
+        <p class="note">
+          This demo keeps Instagram session tokens only in temporary server memory. They are cleared when this
+          request is handled or when the server restarts.
+        </p>
+        <p><a href="/">Back to dashboard</a></p>
+      </section>
+    </main>
+    <script>
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        var code = params.get("code");
+        document.getElementById("confirmationCode").textContent = code || "(not supplied)";
+      })();
+    </script>
+  </body>
+</html>
