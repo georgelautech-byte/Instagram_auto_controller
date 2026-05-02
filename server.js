@@ -534,6 +534,61 @@ async function bufferToInstagramJpeg(buffer) {
   }
 }
 
+/**
+ * Instagram often needs a short delay after POST /{ig-user-id}/media before media_publish.
+ * Error 9007 "Media ID is not available" means the container is not FINISHED yet — poll status.
+ */
+async function fetchIgMediaContainerStatus(containerId, accessToken) {
+  const response = await axios.get(`${FB_GRAPH_BASE}/${containerId}`, {
+    params: {
+      fields: "id,status_code,status",
+      access_token: accessToken
+    }
+  });
+  return response.data;
+}
+
+async function waitForIgMediaContainerReady(containerId, accessToken, options = {}) {
+  const pollMs = options.pollMs ?? 2000;
+  /** Keep under typical reverse-proxy idle limits (Railway/load balancers ~60s). */
+  const maxWaitMs = options.maxWaitMs ?? 55_000;
+  const start = Date.now();
+  let lastCode = null;
+  /** Some image containers omit status_code briefly; assume ready after sustained absence to avoid deadlock. */
+  let missingStatusPolls = 0;
+
+  while (Date.now() - start < maxWaitMs) {
+    const data = await fetchIgMediaContainerStatus(containerId, accessToken);
+    const code = data.status_code;
+    lastCode = code;
+    if (code === "FINISHED") {
+      return data;
+    }
+    if (code === "ERROR" || code === "EXPIRED") {
+      throw new Error(
+        `Instagram media container ${code}: ${data.status || code}. Try another image or reconnect.`
+      );
+    }
+    if (code === "PUBLISHED") {
+      return data;
+    }
+    if (!code || code === "IN_PROGRESS") {
+      missingStatusPolls += code === "IN_PROGRESS" ? 0 : 1;
+      if (!code && missingStatusPolls >= 6 && Date.now() - start >= 6000) {
+        return data;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      continue;
+    }
+    missingStatusPolls = 0;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  throw new Error(
+    `Timed out waiting for Instagram to process the image (${lastCode ?? "unknown"}). Try a smaller JPEG or again later.`
+  );
+}
+
 async function probeUrlReachability(url) {
   try {
     const parsed = new URL(String(url));
@@ -828,7 +883,15 @@ app.post("/api/posts/publish", async (req, res) => {
       }
     );
 
-    const creationId = createMedia.data.id;
+    const creationId = createMedia.data?.id;
+    if (!creationId) {
+      return res.status(502).json({
+        error: "Instagram did not return a media container id.",
+        details: createMedia.data ?? null
+      });
+    }
+
+    await waitForIgMediaContainerReady(creationId, token);
 
     const publishMedia = await axios.post(
       `${FB_GRAPH_BASE}/${state.userId}/media_publish`,
@@ -848,18 +911,33 @@ app.post("/api/posts/publish", async (req, res) => {
     });
   } catch (error) {
     const details = error.response?.data || error.message;
-    const fb = details?.error;
+    const fb = typeof details === "object" && details && "error" in details ? details.error : null;
     const fbMsg = [fb?.error_user_title, fb?.error_user_msg].filter(Boolean).join(": ");
+    const codeNum = typeof fb?.code === "number" ? fb.code : null;
+    const combinedMsg = String(fb?.message || error.message || "");
+    const isMediaNotReady =
+      codeNum === 9007 || /media id is not available/i.test(combinedMsg);
+
+    let hint = null;
+    if (isMediaNotReady) {
+      hint =
+        "Instagram error 9007 (“Media ID is not available”): the media container was not ready for media_publish. This app now waits until status FINISHED; if you still see this, retry or use a smaller JPEG.";
+    } else if (fbMsg && /unsupported|format|unknown|jpeg|jpg/i.test(fbMsg)) {
+      hint =
+        "Ensure image_url serves a plain JPEG binary (HTTPS, no login page). This app converts uploads to .jpg automatically after npm install sharp + redeploy.";
+    } else if (
+      fb?.error_subcode === 2207052 ||
+      /media could not be fetched|retrieve media/i.test(String(fb?.message || ""))
+    ) {
+      hint =
+        "Instagram could not fetch your image URL — confirm it opens directly in an incognito window and serves image/jpeg.";
+    }
+
     return res.status(500).json({
       error: "Failed to publish post",
       details,
       error_user_msg: fb?.error_user_msg || null,
-      hint:
-        fbMsg && /unsupported|format|unknown|jpeg|jpg/i.test(fbMsg)
-          ? "Ensure image_url serves a plain JPEG binary (HTTPS, no login page). This app converts uploads to .jpg automatically after npm install sharp + redeploy."
-          : fb?.error_subcode === 2207052 || /media could not be fetched|retrieve media/i.test(String(fb?.message || ""))
-            ? "Instagram could not fetch your image URL — confirm it opens directly in an incognito window and serves image/jpeg."
-            : null
+      hint
     });
   }
 });
