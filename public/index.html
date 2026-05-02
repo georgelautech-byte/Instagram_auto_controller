@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Instagram Connect Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>Instagram Connect Dashboard</h1>
+      <p class="note">
+        Connect your account, load your previous posts, and publish from this app.
+      </p>
+
+      <section class="panel">
+        <button id="connectBtn">Connect Instagram</button>
+        <button id="loadBtn">Load Past Posts</button>
+      </section>
+
+      <section class="panel">
+        <h2>Publish New Post</h2>
+        <form id="publishForm">
+          <label>
+            Select image file
+            <input id="imageFile" type="file" accept="image/*" required />
+          </label>
+          <label>
+            Caption
+            <textarea id="caption" rows="3" placeholder="Write your caption..."></textarea>
+          </label>
+          <button type="submit">Publish to Instagram</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Past Posts</h2>
+        <p class="note">
+          Comments load when your Meta app has the <code>instagram_manage_comments</code> permission and you reconnect Instagram. You can delete individual comments from the dashboard when comments are loaded. Post delete uses Meta’s API: it can remove many of your professional account’s posts, but not “anything” (for example some ads/boosted items or disallowed placements). Carousel slides are handled by deleting the whole carousel album.
+        </p>
+        <div id="posts" class="posts"></div>
+      </section>
+
+      <section id="status" class="status"></section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+  </html>

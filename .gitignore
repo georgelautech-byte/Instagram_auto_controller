@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Secrets and local env (never commit)
+.env
+.env.*
+!.env.example
+
+# Runtime uploads (local / user content)
+public/uploads/
+
+# Logs and debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor (optional — remove these lines if you want to share editor config)
+.idea/
+.vscode/
