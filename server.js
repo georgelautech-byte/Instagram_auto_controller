@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const crypto = require("crypto");
+const sharp = require("sharp");
 const path = require("path");
 const fs = require("fs");
 const dotenv = require("dotenv");
@@ -466,6 +467,34 @@ async function uploadImageToPublicHost(buffer, fileName, mimeType) {
   throw new Error(`Public image upload failed on all providers. ${errors.join(" | ")}`);
 }
 
+/**
+ * Instagram Content Publishing expects a JPEG at image_url (see Meta IG User Media docs).
+ * Normalize browser/WebP/PNG/HEIF uploads to JPEG and cap dimensions within API guidance.
+ */
+async function bufferToInstagramJpeg(buffer) {
+  try {
+    return await sharp(buffer)
+      .rotate()
+      .resize({
+        width: 1440,
+        height: 1440,
+        fit: "inside",
+        withoutEnlargement: true
+      })
+      .jpeg({
+        quality: 88,
+        mozjpeg: true
+      })
+      .toBuffer();
+  } catch (err) {
+    const enriched = new Error(
+      `${err.message || "Image decode failed"}. Export as JPEG from your editor or Photos if this persists (HEIC can fail on some servers).`
+    );
+    enriched.cause = err;
+    throw enriched;
+  }
+}
+
 async function probeUrlReachability(url) {
   try {
     const parsed = new URL(String(url));
@@ -494,6 +523,44 @@ async function probeUrlReachability(url) {
     return { ok, status: response.status };
   } catch (error) {
     return { ok: false, status: null, error: error.message };
+  }
+}
+
+/**
+ * Mimics Meta/Instagram fetching image_url: no ngrok bypass header — free ngrok often returns HTML instead of JPEG here.
+ */
+async function probeUrlAsMetaImageFetcher(url) {
+  try {
+    const parsed = new URL(String(url));
+    const headers = {
+      "User-Agent":
+        "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+    };
+
+    const response = await axios.get(url, {
+      timeout: 15000,
+      responseType: "stream",
+      maxRedirects: 5,
+      headers,
+      validateStatus: () => true
+    });
+
+    const contentTypeRaw = response.headers["content-type"] || "";
+    const primaryType = contentTypeRaw.split(";")[0].trim().toLowerCase();
+    const statusOk = response.status >= 200 && response.status < 400;
+    const looksLikeImage = /^image\/(jpeg|jpg|pjpeg)$/i.test(primaryType);
+
+    if (response.data && typeof response.data.destroy === "function") {
+      response.data.destroy();
+    }
+
+    return {
+      ok: statusOk && looksLikeImage,
+      status: response.status,
+      contentType: contentTypeRaw
+    };
+  } catch (error) {
+    return { ok: false, status: null, contentType: "", error: error.message };
   }
 }
 
@@ -742,7 +809,19 @@ app.post("/api/posts/publish", async (req, res) => {
     });
   } catch (error) {
     const details = error.response?.data || error.message;
-    return res.status(500).json({ error: "Failed to publish post", details });
+    const fb = details?.error;
+    const fbMsg = [fb?.error_user_title, fb?.error_user_msg].filter(Boolean).join(": ");
+    return res.status(500).json({
+      error: "Failed to publish post",
+      details,
+      error_user_msg: fb?.error_user_msg || null,
+      hint:
+        fbMsg && /unsupported|format|unknown|jpeg|jpg/i.test(fbMsg)
+          ? "Ensure image_url serves a plain JPEG binary (HTTPS, no login page). This app converts uploads to .jpg automatically after npm install sharp + redeploy."
+          : fb?.error_subcode === 2207052 || /media could not be fetched|retrieve media/i.test(String(fb?.message || ""))
+            ? "Instagram could not fetch your image URL — confirm it opens directly in an incognito window and serves image/jpeg."
+            : null
+    });
   }
 });
 
@@ -765,10 +844,21 @@ app.post("/api/uploads", async (req, res) => {
   try {
     const base64Payload = dataUrl.slice(dataPrefix.length);
     const buffer = Buffer.from(base64Payload, "base64");
-    const extension = path.extname(fileName) || `.${mimeType.split("/")[1] || "jpg"}`;
-    const safeFileName = `upload-${Date.now()}${extension}`;
+    let jpegBuffer;
+    try {
+      jpegBuffer = await bufferToInstagramJpeg(buffer);
+    } catch (convertErr) {
+      return res.status(400).json({
+        error: "The image format is not supported or could not be processed.",
+        hint: "Instagram needs JPEG bytes at a public URL — we convert uploads for you. Try a JPG/PNG/WebP screenshot; HEIC/iPhone raw files may fail until exported as JPG.",
+        details: convertErr.message
+      });
+    }
+
+    const safeFileName = `upload-${Date.now()}.jpg`;
     const localFilePath = path.join(uploadDir, safeFileName);
-    fs.writeFileSync(localFilePath, buffer);
+    fs.writeFileSync(localFilePath, jpegBuffer);
+    const outMime = "image/jpeg";
 
     const publicBaseUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL);
     if (publicBaseUrl) {
@@ -789,7 +879,7 @@ app.post("/api/uploads", async (req, res) => {
       return res.json({ imageUrl: `${publicBaseUrl}/uploads/${safeFileName}` });
     }
 
-    const imageUrl = await uploadImageToPublicHost(buffer, safeFileName, mimeType);
+    const imageUrl = await uploadImageToPublicHost(jpegBuffer, safeFileName, outMime);
 
     return res.json({ imageUrl });
   } catch (error) {
@@ -840,6 +930,28 @@ app.get("/api/health/upload", async (req, res) => {
       hint:
         "Open the imageUrl in a normal browser tab. If it does not load, your PUBLIC_BASE_URL is wrong or your tunnel is not running. Also ensure PUBLIC_BASE_URL has no quotes and no trailing slash."
     });
+  }
+
+  let metaProbe = null;
+  try {
+    const hostLower = new URL(imageUrl).hostname.toLowerCase();
+    if (hostLower.includes("ngrok")) {
+      metaProbe = await probeUrlAsMetaImageFetcher(imageUrl);
+      if (!metaProbe.ok) {
+        return res.status(503).json({
+          ok: false,
+          error:
+            "This URL responds for the dashboard probe but probably not like Instagram's crawler — common with free ngrok (HTML intercept / warning page).",
+          instagramStyleProbeHttpStatus: metaProbe.status ?? null,
+          instagramStyleProbeContentType: metaProbe.contentType || null,
+          networkError: metaProbe.error || null,
+          hint:
+            "Set PUBLIC_BASE_URL to your Railway (or production) HTTPS host so image_url matches what Meta crawls. The app uses ngrok-skip-browser-warning for its own health check only; Meta does not send that header."
+        });
+      }
+    }
+  } catch {
+    /* invalid URL handled earlier */
   }
 
   return res.json({ ok: true, url });
